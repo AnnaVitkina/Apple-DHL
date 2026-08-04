@@ -44,6 +44,7 @@ if str(_CODE_DIR) not in sys.path:
 _PIPELINE_MODULES = (
     "project_paths",
     "build_matrix",
+    "build_postal_code_zones",
     "convert_to_processing",
 )
 
