@@ -23,6 +23,14 @@ from project_paths import INPUT_DIR, OUTPUT_DIR, PROCESSING_DIR, ensure_workspac
 
 EXTRACTED_GLOB = "*_extracted.xlsx"
 ISO_COLUMN_PATTERN = re.compile(r"^[A-Z]{2}$")
+PUK_FILE_PATTERN = re.compile(r"DHLPUK", re.IGNORECASE)
+PUK_POSTAL_ZONE_COLUMN_PATTERN = re.compile(r"^[A-Z]{2}_[A-Z0-9]+$")
+EU_FR_POSTAL_FILE_PATTERN = re.compile(
+    r"DHL_.*_EU_(?:AC|FG(?:_TDD)?)",
+    re.IGNORECASE,
+)
+TIME_DEFINITE_PATTERN = re.compile(r"time\s+definite", re.IGNORECASE)
+FR_TIME_DEFINITE_POSTAL_CODE = "98000"
 WEIGHT_RANGE_PATTERN = re.compile(r"^(\d+)\s*(?:to|-)\s*(\d+)$", re.IGNORECASE)
 
 SHIPMENT_COLUMNS = (
@@ -447,6 +455,52 @@ def destination_iso_columns(df: pd.DataFrame) -> list[str]:
     ]
 
 
+def is_puk_rate_file(file_path: Path | str) -> bool:
+    return bool(PUK_FILE_PATTERN.search(Path(file_path).name))
+
+
+def is_eu_fr_postal_duplicate_file(file_path: Path | str) -> bool:
+    stem = Path(file_path).stem.replace("_extracted", "")
+    return bool(EU_FR_POSTAL_FILE_PATTERN.search(stem))
+
+
+def destination_rate_columns(df: pd.DataFrame, *, puk_mode: bool = False) -> list[str]:
+    if puk_mode:
+        return [
+            str(column)
+            for column in df.columns
+            if str(column) not in FIXED_SOURCE_COLUMNS
+        ]
+    return destination_iso_columns(df)
+
+
+def parse_puk_destination_column(
+    column_name: str,
+    *,
+    default_destination_iso: str = "",
+) -> tuple[str, str]:
+    """Map a DHLPUK rate column to destination country and postal code zone."""
+    column = cell_text(column_name).upper()
+    default_destination_iso = cell_text(default_destination_iso).upper()
+
+    if PUK_POSTAL_ZONE_COLUMN_PATTERN.match(column):
+        country = column.split("_", 1)[0]
+        return country, column
+
+    if column == "IE":
+        return "IE", "IE"
+
+    if ISO_COLUMN_PATTERN.match(column):
+        if column == "GB" or column == default_destination_iso:
+            return column, column
+        return column, ""
+
+    if default_destination_iso:
+        return default_destination_iso, column
+
+    return column, ""
+
+
 def is_excluded_matrix_tab(sheet_name: str) -> bool:
     return sheet_name.strip().lower() in EXCLUDED_RATE_TABS
 
@@ -455,6 +509,8 @@ def is_rate_tab(
     sheet_name: str,
     df: pd.DataFrame,
     tab_index_lookup: dict[str, TabIndexInfo] | None = None,
+    *,
+    puk_mode: bool = False,
 ) -> bool:
     if is_excluded_matrix_tab(sheet_name):
         return False
@@ -465,7 +521,7 @@ def is_rate_tab(
     required = {"Origin", "Chargeable Weight", "Rate Logic"}
     if not required.issubset(df.columns):
         return False
-    return bool(destination_iso_columns(df))
+    return bool(destination_rate_columns(df, puk_mode=puk_mode))
 
 
 def list_extracted_files() -> list[Path]:
@@ -512,11 +568,12 @@ def select_extracted_file(files: list[Path], *, auto: bool = False) -> Path:
 def load_rate_tabs(file_path: Path) -> list[tuple[str, pd.DataFrame]]:
     workbook = pd.ExcelFile(file_path)
     tab_index_lookup = build_tab_index_lookup(load_tab_index(file_path))
+    puk_mode = is_puk_rate_file(file_path)
     loaded: list[tuple[str, pd.DataFrame]] = []
 
     for sheet_name in workbook.sheet_names:
         df = pd.read_excel(file_path, sheet_name=sheet_name)
-        if not is_rate_tab(sheet_name, df, tab_index_lookup):
+        if not is_rate_tab(sheet_name, df, tab_index_lookup, puk_mode=puk_mode):
             continue
         loaded.append((sheet_name, df))
 
@@ -734,6 +791,33 @@ def append_return_lanes(
     return pd.concat([matrix_df, pd.DataFrame(return_rows)], ignore_index=True)
 
 
+def append_fr_time_definite_postal_lanes(matrix_df: pd.DataFrame) -> pd.DataFrame:
+    """Duplicate FR Time Definite lanes with Destination Postal Code 98000."""
+    if matrix_df.empty:
+        return matrix_df
+
+    destination_country = matrix_df["Destination country"].fillna("").astype(str).str.strip().str.upper()
+    shipment_type = matrix_df["Shipment Type"].fillna("").astype(str)
+    postal_code = matrix_df["Destination Postal Code"].fillna("").astype(str).str.strip()
+
+    matching_mask = (
+        destination_country.eq("FR")
+        & shipment_type.str.contains(TIME_DEFINITE_PATTERN, na=False)
+        & ~postal_code.eq(FR_TIME_DEFINITE_POSTAL_CODE)
+    )
+    matching = matrix_df[matching_mask]
+    if matching.empty:
+        return matrix_df
+
+    duplicates: list[dict[str, object]] = []
+    for _, row in matching.iterrows():
+        duplicate = row.to_dict()
+        duplicate["Destination Postal Code"] = FR_TIME_DEFINITE_POSTAL_CODE
+        duplicates.append(duplicate)
+
+    return pd.concat([matrix_df, pd.DataFrame(duplicates)], ignore_index=True)
+
+
 def finalize_lane_numbers(matrix_df: pd.DataFrame) -> pd.DataFrame:
     if matrix_df.empty:
         return matrix_df
@@ -809,10 +893,11 @@ def lane_key(
     stream_id: str,
     *,
     tab_name: str = "",
+    destination_postal_code: str = "",
 ) -> tuple[str, ...]:
     if is_sfs_tab(tab_name):
-        return (tab_name, origin, destination, shipment_type, stream_id)
-    return (origin, destination, shipment_type, stream_id)
+        return (tab_name, origin, destination, destination_postal_code, shipment_type, stream_id)
+    return (origin, destination, destination_postal_code, shipment_type, stream_id)
 
 
 def _is_first_weight_bracket(chargeable_weight: object) -> bool:
@@ -841,13 +926,17 @@ def block_stream_id(block_df: pd.DataFrame) -> str:
     return cell_text(first_row.get("Service Level")) or cell_text(first_row.get("Shipment Type"))
 
 
-def build_shipment_and_cost_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+def build_shipment_and_cost_rows(
+    rate_tabs: list[tuple[str, pd.DataFrame]],
+    *,
+    puk_mode: bool = False,
+) -> pd.DataFrame:
     standard_columns, sfs_columns, _, _ = collect_transport_cost_columns(rate_tabs)
     transport_columns = [*standard_columns, *sfs_columns]
     lanes: dict[tuple[str, ...], dict[str, object]] = {}
 
     for tab_name, source_df in rate_tabs:
-        iso_columns = destination_iso_columns(source_df)
+        dest_columns = destination_rate_columns(source_df, puk_mode=puk_mode)
 
         for block_df in iter_rate_blocks(source_df):
             if block_df.empty:
@@ -862,6 +951,7 @@ def build_shipment_and_cost_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> p
 
                 origin = cell_text(source_row.get("Origin"))
                 shipment_type = cell_text(source_row.get("Shipment Type"))
+                default_destination_iso = cell_text(source_row.get("Destination ISO"))
                 use_sfs_cost = is_sfs_tab(tab_name)
                 cost_column = (
                     sfs_transport_cost_column_name(bracket)
@@ -869,17 +959,27 @@ def build_shipment_and_cost_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> p
                     else transport_cost_column_name(bracket)
                 )
 
-                for iso_column in iso_columns:
-                    rate = rate_value(source_row.get(iso_column))
+                for dest_column in dest_columns:
+                    rate = rate_value(source_row.get(dest_column))
                     if rate is None:
                         continue
 
+                    if puk_mode:
+                        destination_country, destination_postal_code = parse_puk_destination_column(
+                            dest_column,
+                            default_destination_iso=default_destination_iso,
+                        )
+                    else:
+                        destination_country = dest_column
+                        destination_postal_code = ""
+
                     key = lane_key(
                         origin,
-                        iso_column,
+                        destination_country,
                         shipment_type,
                         stream_id,
                         tab_name=tab_name,
+                        destination_postal_code=destination_postal_code,
                     )
                     if key not in lanes:
                         lanes[key] = {
@@ -888,8 +988,8 @@ def build_shipment_and_cost_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> p
                             "Shipment Type": shipment_type,
                             "Service": "",
                             "Service level": stream_id,
-                            "Destination country": iso_column,
-                            "Destination Postal Code": "",
+                            "Destination country": destination_country,
+                            "Destination Postal Code": destination_postal_code,
                             "Carrier Account number": "",
                             "Business Segment": "",
                             "Category": "",
@@ -1192,6 +1292,7 @@ def run_build_matrix(
         file_path = select_extracted_file(files, auto=auto)
 
     rate_tabs = load_rate_tabs(file_path)
+    puk_mode = is_puk_rate_file(file_path)
     if not rate_tabs:
         raise RuntimeError(
             f"No active rate tabs found in {file_path.name}. "
@@ -1200,11 +1301,13 @@ def run_build_matrix(
         )
 
     print(f"\nBuilding matrix from {file_path.name}:")
+    if puk_mode:
+        print("  DHLPUK mode: postal code zones enabled (GB_NI, GB_HI, IE, ...)")
     for tab_name, tab_df in rate_tabs:
         print(f"  - {tab_name}: {len(tab_df)} source rows")
 
     _, _, bracket_rate_by, sfs_bracket_rate_by = collect_transport_cost_columns(rate_tabs)
-    matrix_df = build_shipment_and_cost_rows(rate_tabs)
+    matrix_df = build_shipment_and_cost_rows(rate_tabs, puk_mode=puk_mode)
     tab_index_df = load_tab_index(file_path)
     billing_bs_lookup = load_billing_bs_lookup()
     matrix_df = enrich_matrix_with_tab_index(
@@ -1212,6 +1315,16 @@ def run_build_matrix(
         tab_index_df,
         billing_bs_lookup=billing_bs_lookup,
     )
+    if is_eu_fr_postal_duplicate_file(file_path):
+        before_count = len(matrix_df)
+        matrix_df = append_fr_time_definite_postal_lanes(matrix_df)
+        added = len(matrix_df) - before_count
+        if added:
+            matrix_df = finalize_lane_numbers(matrix_df)
+            print(
+                f"  FR Time Definite postal lanes added: {added} "
+                f"(Destination Postal Code {FR_TIME_DEFINITE_POSTAL_CODE})"
+            )
 
     return_tab_names = [
         tab_name
@@ -1239,6 +1352,10 @@ def run_build_matrix(
         sfs_bracket_rate_by=sfs_bracket_rate_by,
         output_path=output_path,
     )
+    if puk_mode:
+        from build_postal_code_zones import run_build_postal_code_zones
+
+        run_build_postal_code_zones(extracted_file=file_path)
     print(f"\nSaved matrix ({len(matrix_df)} lanes) to: {saved_path}")
     print(f"  Weight brackets: {', '.join(bracket_rate_by.keys())}")
     return saved_path
