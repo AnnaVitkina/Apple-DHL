@@ -38,6 +38,8 @@ HEADER_MARKERS = (
 )
 
 TAB_INDEX_HEADER_MARKERS = ("tab-name",)
+PUK_FILE_PATTERN = re.compile(r"DHLPUK", re.IGNORECASE)
+PUK_DESTINATION_COLUMN_PATTERN = re.compile(r"^(GB|GB_NI|GB_HI|IE|[A-Z]{2})$")
 
 METADATA_LABELS = {
     "version number": "Version Number",
@@ -374,14 +376,23 @@ def _drop_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[non_empty_mask].copy()
 
 
-def _drop_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _is_puk_destination_column(column: object) -> bool:
+    return bool(PUK_DESTINATION_COLUMN_PATTERN.match(_cell_text(column).upper()))
+
+
+def _drop_empty_columns(
+    df: pd.DataFrame,
+    *,
+    preserve_columns: set[str] | None = None,
+) -> pd.DataFrame:
     if df.empty:
         return df
 
+    preserve_columns = preserve_columns or set()
     keep_columns = [
         column
         for column in df.columns
-        if any(_cell_text(value) for value in df[column])
+        if column in preserve_columns or any(_cell_text(value) for value in df[column])
     ]
     return df.loc[:, keep_columns].copy()
 
@@ -449,7 +460,12 @@ def _attach_metadata_columns(df: pd.DataFrame, metadata: SheetMetadata) -> pd.Da
     return enriched
 
 
-def clean_tab_df(df_raw: pd.DataFrame, sheet_name: str | None = None) -> pd.DataFrame:
+def clean_tab_df(
+    df_raw: pd.DataFrame,
+    sheet_name: str | None = None,
+    *,
+    source_file: Path | None = None,
+) -> pd.DataFrame:
     """Remove preamble rows above the header and fully empty rows/columns."""
     if sheet_name and sheet_name.strip().lower() == "tab index":
         return clean_tab_index_df(df_raw)
@@ -472,14 +488,21 @@ def clean_tab_df(df_raw: pd.DataFrame, sheet_name: str | None = None) -> pd.Data
     df = df_raw.iloc[data_start:].copy()
     df.columns = headers
     df = _drop_empty_rows(df)
-    df = _drop_empty_columns(df)
+    preserve_columns: set[str] = set()
+    if source_file is not None and PUK_FILE_PATTERN.search(source_file.name):
+        preserve_columns = {
+            str(column)
+            for column in df.columns
+            if _is_puk_destination_column(column)
+        }
+    df = _drop_empty_columns(df, preserve_columns=preserve_columns)
     df = df.reset_index(drop=True)
     return _attach_metadata_columns(df, metadata)
 
 
 def tab_to_df(file_path: Path, sheet_name: str) -> pd.DataFrame:
     raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
-    return clean_tab_df(raw, sheet_name=sheet_name)
+    return clean_tab_df(raw, sheet_name=sheet_name, source_file=file_path)
 
 
 MAX_SHEET_NAME_LEN = 31
@@ -516,7 +539,7 @@ def collect_frames(
         try:
             raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
             metadata = extract_sheet_metadata(raw)
-            df = clean_tab_df(raw, sheet_name=sheet_name)
+            df = clean_tab_df(raw, sheet_name=sheet_name, source_file=file_path)
             removed_rows = len(raw) - len(df)
         except Exception as exc:
             print(f"Skipping {sheet_name}: could not read sheet ({exc})")
