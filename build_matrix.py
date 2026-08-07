@@ -22,6 +22,8 @@ from openpyxl.utils import get_column_letter
 from project_paths import INPUT_DIR, OUTPUT_DIR, PROCESSING_DIR, ensure_workspace_dirs
 
 EXTRACTED_GLOB = "*_extracted.xlsx"
+RA_SUBDIR = "RA"
+EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
 ISO_COLUMN_PATTERN = re.compile(r"^[A-Z]{2}$")
 PUK_FILE_PATTERN = re.compile(r"DHLPUK", re.IGNORECASE)
 PUK_POSTAL_ZONE_COLUMN_PATTERN = re.compile(r"^[A-Z]{2}_[A-Z0-9]+$")
@@ -60,6 +62,27 @@ SFS_TRANSPORT_COST_GROUP = "Transport cost (SFS)"
 SFS_TAB_NAME = "SFS"
 EXCLUDED_RATE_TABS = {"tab index", "accessorials"}
 BILLING_BS_GLOB = "billing-bs*"
+RA_RATE_CARD_SHEET = "rate card"
+RA_HEADER_SCAN_ROWS = 25
+RA_ORIGIN_HEADER_ALIASES = frozenset({"origin country", "origin"})
+RA_DESTINATION_HEADER_ALIASES = frozenset(
+    {"destination country", "destination", "destination iso"}
+)
+RA_FILL_FIELDS = frozenset({"Category", "Shipping Condition"})
+RA_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "Tab": ("tab", "tab name", "tab-name"),
+    "Origin country": ("origin country", "origin"),
+    "Destination country": ("destination country", "destination", "destination iso"),
+    "Destination Postal Code": (
+        "destination postal code",
+        "postal code",
+        "destination postal",
+    ),
+    "Shipment Type": ("shipment type",),
+    "Service level": ("service level",),
+    "Category": ("category",),
+    "Shipping Condition": ("shipping condition",),
+}
 CARRIER_ACCOUNT_SPLIT_PATTERN = re.compile(r"[,/;]+")
 CARRIER_ACCOUNT_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9]+\b")
 BUSINESS_SEGMENT_ABBREVIATIONS: dict[str, str] = {
@@ -102,6 +125,7 @@ COLUMN_HEADER_ROW = 5
 DATA_START_ROW = 6
 
 HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")
+RA_FILL_HIGHLIGHT = PatternFill("solid", fgColor="FFFF00")
 TRANSPORT_GROUP_FILL = PatternFill("solid", fgColor="9BC2E6")
 TRANSPORT_COST_FILL = PatternFill("solid", fgColor="BDD7EE")
 COST_META_FILL = PatternFill("solid", fgColor="F2F2F2")
@@ -552,6 +576,24 @@ def prompt_selection(title: str, items: list[str]) -> int:
         print("Number is out of range. Try again.")
 
 
+def prompt_optional_selection(title: str, items: list[str]) -> int | None:
+    print(f"\n{title}")
+    for index, item in enumerate(items, start=1):
+        print(f"  {index}. {item}")
+
+    while True:
+        raw = input("Enter number or press Enter to skip: ").strip()
+        if not raw:
+            return None
+        if not raw.isdigit():
+            print("Please enter a valid number, or press Enter to skip.")
+            continue
+        choice = int(raw)
+        if 1 <= choice <= len(items):
+            return choice - 1
+        print("Number is out of range. Try again.")
+
+
 def select_extracted_file(files: list[Path], *, auto: bool = False) -> Path:
     if not files:
         print(f"No extracted files found in: {PROCESSING_DIR}")
@@ -589,6 +631,12 @@ class TabIndexInfo:
     origins: str
 
 
+@dataclass(frozen=True)
+class RaLaneEntry:
+    service_level_tokens: frozenset[str]
+    values: dict[str, str]
+
+
 def normalize_billing_accounts(value: object) -> str:
     text = cell_text(value).replace("\n", " ")
     parts = [part.strip() for part in re.split(r"\s*;\s*", text) if part.strip()]
@@ -598,6 +646,311 @@ def normalize_billing_accounts(value: object) -> str:
 def billing_bs_file_path() -> Path | None:
     matches = sorted(INPUT_DIR.glob(BILLING_BS_GLOB))
     return matches[0] if matches else None
+
+
+def ra_input_dir() -> Path:
+    return INPUT_DIR / RA_SUBDIR
+
+
+def list_ra_files() -> list[Path]:
+    ra_dir = ra_input_dir()
+    if not ra_dir.is_dir():
+        return []
+
+    return [
+        path
+        for path in sorted(ra_dir.iterdir())
+        if path.is_file()
+        and path.suffix.lower() in EXCEL_SUFFIXES
+        and not path.name.startswith("~$")
+    ]
+
+
+def select_ra_file(files: list[Path], *, auto: bool = False) -> Path | None:
+    if not files:
+        return None
+
+    if auto:
+        if len(files) == 1:
+            print(f"\nAuto mode: using RA file {files[0].name}")
+            return files[0]
+        return None
+
+    labels = [path.name for path in files]
+    choice = prompt_optional_selection(
+        "Optional RA lookup file for Category / Shipping Condition:",
+        labels,
+    )
+    if choice is None:
+        print("Skipping RA lookup.")
+        return None
+    return files[choice]
+
+
+def normalize_header_name(value: object) -> str:
+    return re.sub(r"\s+", " ", cell_text(value).lower())
+
+
+def find_rate_card_sheet_name(workbook: pd.ExcelFile) -> str | None:
+    for sheet_name in workbook.sheet_names:
+        if sheet_name.strip().lower() == RA_RATE_CARD_SHEET:
+            return sheet_name
+    return None
+
+
+def find_ra_header_row(preview: pd.DataFrame) -> int | None:
+    scan_limit = min(len(preview), RA_HEADER_SCAN_ROWS)
+    for row_idx in range(scan_limit):
+        labels = {
+            normalize_header_name(value)
+            for value in preview.iloc[row_idx]
+            if not pd.isna(value)
+        }
+        if labels & RA_ORIGIN_HEADER_ALIASES and labels & RA_DESTINATION_HEADER_ALIASES:
+            return row_idx
+    return None
+
+
+def read_ra_rate_card_dataframe(file_path: Path) -> tuple[pd.DataFrame | None, str]:
+    try:
+        workbook = pd.ExcelFile(file_path)
+    except Exception as exc:
+        return None, f"could not open workbook ({exc})"
+
+    sheet_name = find_rate_card_sheet_name(workbook)
+    if sheet_name is None:
+        available = ", ".join(workbook.sheet_names) or "(none)"
+        return None, f"Rate card sheet not found (available: {available})"
+
+    preview = pd.read_excel(
+        file_path,
+        sheet_name=sheet_name,
+        header=None,
+        nrows=RA_HEADER_SCAN_ROWS,
+    )
+    header_row = find_ra_header_row(preview)
+    if header_row is None:
+        return None, "Rate card sheet is missing Origin/Destination header row"
+
+    ra_df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
+    ra_df.columns = [str(column).strip() for column in ra_df.columns]
+    if ra_df.empty:
+        return None, "Rate card sheet is empty"
+
+    column_map = resolve_ra_column_map(ra_df)
+    origin_column = column_map.get("Origin country")
+    destination_column = column_map.get("Destination country")
+    if origin_column is None or destination_column is None:
+        headers = ", ".join(str(column) for column in ra_df.columns[:20])
+        return None, f"Rate card sheet is missing Origin/Destination columns (headers: {headers})"
+
+    lane_mask = (
+        ra_df[origin_column].fillna("").astype(str).str.strip().ne("")
+        & ra_df[destination_column].fillna("").astype(str).str.strip().ne("")
+    )
+    ra_df = ra_df.loc[lane_mask].copy()
+    if ra_df.empty:
+        return None, "Rate card sheet has no lane rows"
+
+    return ra_df, ""
+
+
+def resolve_ra_column_map(df: pd.DataFrame) -> dict[str, str]:
+    column_names = {str(column).strip(): str(column) for column in df.columns}
+    resolved: dict[str, str] = {}
+
+    normalized_by_column = {
+        column: normalize_header_name(column) for column in column_names
+    }
+    for canonical, aliases in RA_COLUMN_ALIASES.items():
+        for column, normalized in normalized_by_column.items():
+            if normalized in aliases:
+                resolved[canonical] = column_names[column]
+                break
+    return resolved
+
+
+def service_level_tokens(value: object) -> frozenset[str]:
+    return frozenset(
+        token
+        for token in re.split(r"[,/;\s]+", cell_text(value).upper())
+        if token
+    )
+
+
+def service_level_match_score(
+    left_tokens: frozenset[str],
+    right_tokens: frozenset[str],
+) -> int:
+    if not left_tokens and not right_tokens:
+        return 1
+    if not left_tokens or not right_tokens:
+        return 0
+    return len(left_tokens & right_tokens)
+
+
+def ra_lane_base_key(
+    *,
+    tab_name: str,
+    origin: str,
+    destination: str,
+    shipment_type: str,
+    destination_postal_code: str,
+) -> tuple[str, ...]:
+    tab_name = cell_text(tab_name).upper()
+    origin = cell_text(origin).upper()
+    destination = cell_text(destination).upper()
+    shipment_type = cell_text(shipment_type).upper()
+    destination_postal_code = cell_text(destination_postal_code).upper()
+    if is_sfs_tab(tab_name):
+        return (tab_name, origin, destination, destination_postal_code, shipment_type)
+    return (origin, destination, destination_postal_code, shipment_type)
+
+
+def ra_lane_base_key_from_mapping(
+    row: pd.Series,
+    column_map: dict[str, str],
+) -> tuple[str, ...] | None:
+    origin_column = column_map.get("Origin country")
+    destination_column = column_map.get("Destination country")
+    if not origin_column or not destination_column:
+        return None
+
+    origin = cell_text(row.get(origin_column))
+    destination = cell_text(row.get(destination_column))
+    if not origin or not destination:
+        return None
+
+    tab_name = cell_text(row.get(column_map["Tab"])) if "Tab" in column_map else ""
+    shipment_type = (
+        cell_text(row.get(column_map["Shipment Type"]))
+        if "Shipment Type" in column_map
+        else ""
+    )
+    destination_postal_code = (
+        cell_text(row.get(column_map["Destination Postal Code"]))
+        if "Destination Postal Code" in column_map
+        else ""
+    )
+    return ra_lane_base_key(
+        tab_name=tab_name,
+        origin=origin,
+        destination=destination,
+        shipment_type=shipment_type,
+        destination_postal_code=destination_postal_code,
+    )
+
+
+def matrix_row_ra_base_key(row: pd.Series) -> tuple[str, ...]:
+    return ra_lane_base_key(
+        tab_name=cell_text(row.get("Tab")),
+        origin=cell_text(row.get("Origin country")),
+        destination=cell_text(row.get("Destination country")),
+        shipment_type=cell_text(row.get("Shipment Type")),
+        destination_postal_code=cell_text(row.get("Destination Postal Code")),
+    )
+
+
+def load_ra_lookup(
+    file_path: Path,
+) -> tuple[dict[tuple[str, ...], list[RaLaneEntry]] | None, frozenset[str] | str]:
+    ra_df, read_error = read_ra_rate_card_dataframe(file_path)
+    if ra_df is None:
+        return None, read_error
+
+    column_map = resolve_ra_column_map(ra_df)
+    fill_fields = frozenset(field for field in RA_FILL_FIELDS if field in column_map)
+    if not fill_fields:
+        headers = ", ".join(str(column) for column in ra_df.columns)
+        return None, f"Rate card sheet has no Category/Shipping Condition columns (headers: {headers})"
+
+    lookup: dict[tuple[str, ...], list[RaLaneEntry]] = {}
+    for _, row in ra_df.iterrows():
+        base_key = ra_lane_base_key_from_mapping(row, column_map)
+        if base_key is None:
+            continue
+
+        values: dict[str, str] = {}
+        for field in fill_fields:
+            value = cell_text(row.get(column_map[field]))
+            if value:
+                values[field] = value
+        if not values:
+            continue
+
+        service_level = (
+            cell_text(row.get(column_map["Service level"]))
+            if "Service level" in column_map
+            else ""
+        )
+        entry = RaLaneEntry(
+            service_level_tokens=service_level_tokens(service_level),
+            values=values,
+        )
+        lookup.setdefault(base_key, []).append(entry)
+
+    if not lookup:
+        return None, "Rate card sheet has no lane rows with Category/Shipping Condition values"
+    return lookup, fill_fields
+
+
+def match_ra_values_for_row(
+    row: pd.Series,
+    lookup: dict[tuple[str, ...], list[RaLaneEntry]],
+) -> dict[str, str] | None:
+    candidates = lookup.get(matrix_row_ra_base_key(row))
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0].values
+
+    matrix_tokens = service_level_tokens(row.get("Service level"))
+    best_entry = max(
+        candidates,
+        key=lambda entry: service_level_match_score(
+            entry.service_level_tokens,
+            matrix_tokens,
+        ),
+    )
+    if service_level_match_score(best_entry.service_level_tokens, matrix_tokens) <= 0:
+        return None
+    return best_entry.values
+
+
+def apply_ra_lookup(
+    matrix_df: pd.DataFrame,
+    lookup: dict[tuple[str, ...], list[RaLaneEntry]],
+    *,
+    fill_fields: frozenset[str],
+) -> tuple[pd.DataFrame, set[tuple[int, str]]]:
+    filled_cells: set[tuple[int, str]] = set()
+    if matrix_df.empty or not lookup or not fill_fields:
+        return matrix_df, filled_cells
+
+    result = matrix_df.copy()
+    for field in fill_fields:
+        if field not in result.columns:
+            result[field] = ""
+
+    for position, (index, row) in enumerate(result.iterrows()):
+        category = cell_text(row.get("Category"))
+        if category == RETURN_CATEGORY:
+            continue
+
+        ra_values = match_ra_values_for_row(row, lookup)
+        if ra_values is None:
+            continue
+
+        for field in fill_fields:
+            value = ra_values.get(field, "")
+            if not value:
+                continue
+            current = cell_text(result.at[index, field])
+            if not current:
+                result.at[index, field] = value
+                filled_cells.add((position, field))
+
+    return result, filled_cells
 
 
 def normalize_business_segment_name(name: object) -> str:
@@ -1151,10 +1504,12 @@ def write_matrix_sheet(
     bracket_rate_by: dict[str, str],
     sfs_bracket_rate_by: dict[str, str] | None = None,
     sheet_name: str = "Rate card",
+    ra_filled_cells: set[tuple[int, str]] | None = None,
 ) -> None:
     worksheet = workbook.active
     worksheet.title = sheet_name
     sfs_bracket_rate_by = sfs_bracket_rate_by or {}
+    ra_filled_cells = ra_filled_cells or set()
 
     standard_columns = [
         column for column in matrix_df.columns if is_standard_weight_bracket_cost_column(column)
@@ -1220,6 +1575,8 @@ def write_matrix_sheet(
             cell = worksheet.cell(excel_row, col_index, row.get(header))
             cell.alignment = LEFT
             cell.border = THIN_BORDER
+            if (matrix_index, header) in ra_filled_cells:
+                cell.fill = RA_FILL_HIGHLIGHT
 
         if standard_columns or sfs_columns:
             currency_cell = worksheet.cell(excel_row, currency_col, row.get(CURRENCY_COLUMN))
@@ -1263,6 +1620,7 @@ def save_matrix(
     bracket_rate_by: dict[str, str],
     sfs_bracket_rate_by: dict[str, str] | None = None,
     output_path: Path | None = None,
+    ra_filled_cells: set[tuple[int, str]] | None = None,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if output_path is None:
@@ -1274,6 +1632,7 @@ def save_matrix(
         matrix_df,
         bracket_rate_by=bracket_rate_by,
         sfs_bracket_rate_by=sfs_bracket_rate_by,
+        ra_filled_cells=ra_filled_cells,
     )
     workbook.save(output_path)
     return output_path
@@ -1326,6 +1685,47 @@ def run_build_matrix(
                 f"(Destination Postal Code {FR_TIME_DEFINITE_POSTAL_CODE})"
             )
 
+    ra_filled_cells: set[tuple[int, str]] = set()
+    ra_file = select_ra_file(list_ra_files(), auto=auto)
+    if ra_file is not None:
+        ra_lookup, ra_fill_fields_or_reason = load_ra_lookup(ra_file)
+        if ra_lookup is None:
+            print(f"  RA lookup skipped for {ra_file.name}: {ra_fill_fields_or_reason}")
+        else:
+            ra_fill_fields = ra_fill_fields_or_reason
+            before_filled = {
+                field: matrix_df[field].fillna("").astype(str).str.strip().ne("").sum()
+                for field in ra_fill_fields
+                if field in matrix_df.columns
+            }
+            matrix_df, ra_filled_cells = apply_ra_lookup(
+                matrix_df,
+                ra_lookup,
+                fill_fields=ra_fill_fields,
+            )
+            after_filled = {
+                field: matrix_df[field].fillna("").astype(str).str.strip().ne("").sum()
+                for field in ra_fill_fields
+                if field in matrix_df.columns
+            }
+            filled_counts = {
+                field: after_filled.get(field, 0) - before_filled.get(field, 0)
+                for field in ra_fill_fields
+            }
+            ra_lane_count = sum(len(entries) for entries in ra_lookup.values())
+            matched_lanes = sum(
+                1
+                for _, row in matrix_df.iterrows()
+                if cell_text(row.get("Category")) != RETURN_CATEGORY
+                and match_ra_values_for_row(row, ra_lookup) is not None
+            )
+            print(
+                f"  RA lookup from {ra_file.name} (Rate card tab): "
+                f"{ra_lane_count} RA lane(s), {matched_lanes} matched in result; filled "
+                + ", ".join(f"{field}={filled_counts[field]}" for field in ra_fill_fields)
+                + (f"; highlighted {len(ra_filled_cells)} cell(s)" if ra_filled_cells else "")
+            )
+
     return_tab_names = [
         tab_name
         for tab_name, tab_info in build_tab_index_lookup(tab_index_df).items()
@@ -1351,6 +1751,7 @@ def run_build_matrix(
         bracket_rate_by=bracket_rate_by,
         sfs_bracket_rate_by=sfs_bracket_rate_by,
         output_path=output_path,
+        ra_filled_cells=ra_filled_cells,
     )
     if puk_mode:
         from build_postal_code_zones import run_build_postal_code_zones
