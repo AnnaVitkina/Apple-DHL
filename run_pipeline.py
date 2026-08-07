@@ -1,37 +1,28 @@
 """
-FSC — end-to-end rate pipeline.
+DHL — end-to-end rate pipeline.
 
 Steps:
-  1. Select RA and FSC input files
-  2. Convert Rate card / FSC tabs to processing workbooks
-  3. Match fuel surcharge values by origin and destination city
-  4. Save formatted Rate card workbook to output/
+  1. Select input file and tabs, convert to processing/
+  2. Build matrix workbook in output/
 
 Usage (local):
   python run_pipeline.py
   python run_pipeline.py --auto
-  python run_pipeline.py --ra-file "input/RA/file.xlsx" --fsc-file "input/fsc/file.xlsx"
+  python run_pipeline.py --convert-only
+  python run_pipeline.py --matrix-only
 
 Usage (Google Colab):
   from google.colab import drive
   drive.mount("/content/drive")
 
-  import sys
-  sys.path.insert(0, "/content/Apple-FSC")
+  import os
+  os.environ["DHL_AUTO"] = "1"          # optional: default tabs, no prompts
+  # os.environ["DHL_MATRIX_ONLY"] = "1" # optional: skip conversion step
 
-  from run_pipeline import run_pipeline
-  run_pipeline()
+  exec(open("/content/Apple-DHL/run_pipeline.py", encoding="utf-8").read())
 
-  # Optional: skip file-selection prompts
-  # import os
-  # os.environ["FSC_AUTO"] = "1"
-  # run_pipeline(auto=True)
-
-  # Optional: override Drive data folder
-  # os.environ["FSC_DRIVE_BASE"] = (
-  #     "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team "
-  #     "/Documents/AI Adoption RMT/RMT_Apple/RMT_FSC"
-  # )
+Code lives in /content/Apple-DHL.
+Input/processing/output are read from the shared Drive RMT_DHL folder when mounted.
 """
 
 from __future__ import annotations
@@ -42,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-_CODE_DIR = Path(os.environ.get("FSC_ROOT", "/content/Apple-FSC")).resolve()
+_CODE_DIR = Path(os.environ.get("DHL_CODE_DIR", "/content/Apple-DHL")).resolve()
 try:
     _CODE_DIR = Path(__file__).resolve().parent
 except NameError:
@@ -52,12 +43,13 @@ if str(_CODE_DIR) not in sys.path:
 
 _PIPELINE_MODULES = (
     "project_paths",
-    "excel_formatting",
+    "build_matrix",
+    "build_postal_code_zones",
     "convert_to_processing",
 )
 
 
-def _bootstrap_paths():
+def _bootstrap_paths() -> None:
     for module_name in _PIPELINE_MODULES:
         sys.modules.pop(module_name, None)
 
@@ -71,78 +63,85 @@ _project_paths = _bootstrap_paths()
 configure_paths_from_env = _project_paths.configure_paths_from_env
 print_path_config = _project_paths.print_path_config
 
-from convert_to_processing import ConvertResult, run_convert
+from build_matrix import run_build_matrix
+from convert_to_processing import run_convert
 
 
 @dataclass(frozen=True)
 class PipelineResult:
-    convert: ConvertResult
+    processing_path: Path | None
+    output_path: Path | None
 
 
 def run_pipeline(
     *,
     auto: bool = False,
-    ra_file: Path | None = None,
-    fsc_file: Path | None = None,
-    fsc_sheet: str | None = None,
+    convert_only: bool = False,
+    matrix_only: bool = False,
+    processing_path: Path | None = None,
     output_path: Path | None = None,
 ) -> PipelineResult:
+    if convert_only and matrix_only:
+        raise ValueError("Use only one of --convert-only or --matrix-only.")
+
     configure_paths_from_env()
     print_path_config()
+    saved_processing_path = processing_path
+    saved_output_path: Path | None = None
 
-    print("\n=== Step 1/3: Load RA and FSC input files ===")
-    convert_result = run_convert(
-        auto=auto,
-        ra_file=ra_file,
-        fsc_file=fsc_file,
-        fsc_sheet=fsc_sheet,
-        output_path=output_path,
-    )
+    if not matrix_only:
+        print("\n=== Step 1/2: Convert input to processing ===")
+        saved_processing_path = run_convert(auto=auto)
 
-    print("\n=== Step 2/3: Processing workbooks saved ===")
-    print(f"  RA processing:  {convert_result.ra_processing_path}")
-    print(f"  FSC processing: {convert_result.fsc_processing_path}")
-
-    print("\n=== Step 3/3: Formatted output saved ===")
-    print(f"  Output workbook: {convert_result.output_path}")
-    print(
-        f"  Matched lanes:   {convert_result.matched_lane_count} / "
-        f"{convert_result.total_lane_count}"
-    )
+    if not convert_only:
+        step_label = "Step 2/2" if not matrix_only else "Step 1/1"
+        print(f"\n=== {step_label}: Build matrix ===")
+        saved_output_path = run_build_matrix(
+            source_file=saved_processing_path,
+            output_path=output_path,
+            auto=auto or matrix_only,
+        )
 
     print("\n=== Pipeline complete ===")
-    return PipelineResult(convert=convert_result)
+    if saved_processing_path is not None:
+        print(f"  Processing workbook: {saved_processing_path}")
+    if saved_output_path is not None:
+        print(f"  Output workbook:     {saved_output_path}")
+
+    return PipelineResult(
+        processing_path=saved_processing_path,
+        output_path=saved_output_path,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the FSC end-to-end rate pipeline.")
+    parser = argparse.ArgumentParser(description="Run the DHL end-to-end rate pipeline.")
     parser.add_argument(
         "--auto",
         action="store_true",
-        help="Use the first available RA/FSC files and skip interactive prompts.",
+        help="Use default tabs and skip interactive prompts where possible.",
     )
     parser.add_argument(
-        "--ra-file",
+        "--convert-only",
+        action="store_true",
+        help="Only run input -> processing conversion.",
+    )
+    parser.add_argument(
+        "--matrix-only",
+        action="store_true",
+        help="Only build matrix from the latest extracted processing file.",
+    )
+    parser.add_argument(
+        "--processing",
         type=Path,
         default=None,
-        help="Optional RA input workbook path.",
-    )
-    parser.add_argument(
-        "--fsc-file",
-        type=Path,
-        default=None,
-        help="Optional FSC input workbook path.",
-    )
-    parser.add_argument(
-        "--fsc-sheet",
-        default=None,
-        help="Optional FSC sheet name.",
+        help="Optional extracted processing workbook for --matrix-only.",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Optional formatted output workbook path.",
+        help="Optional output matrix workbook path.",
     )
     return parser.parse_args()
 
@@ -152,9 +151,9 @@ def main() -> int:
         args = _parse_args()
         run_pipeline(
             auto=args.auto,
-            ra_file=args.ra_file,
-            fsc_file=args.fsc_file,
-            fsc_sheet=args.fsc_sheet,
+            convert_only=args.convert_only,
+            matrix_only=args.matrix_only,
+            processing_path=args.processing,
             output_path=args.output,
         )
         return 0
@@ -181,11 +180,9 @@ def _running_in_notebook() -> bool:
 if __name__ == "__main__":
     if _running_in_notebook():
         run_pipeline(
-            auto=_env_flag("FSC_AUTO"),
-            ra_file=Path(os.environ["FSC_RA_FILE"]) if os.environ.get("FSC_RA_FILE") else None,
-            fsc_file=Path(os.environ["FSC_FSC_FILE"]) if os.environ.get("FSC_FSC_FILE") else None,
-            fsc_sheet=os.environ.get("FSC_FSC_SHEET"),
-            output_path=Path(os.environ["FSC_OUTPUT"]) if os.environ.get("FSC_OUTPUT") else None,
+            auto=_env_flag("DHL_AUTO"),
+            convert_only=_env_flag("DHL_CONVERT_ONLY"),
+            matrix_only=_env_flag("DHL_MATRIX_ONLY"),
         )
     else:
         raise SystemExit(main())
