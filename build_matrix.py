@@ -246,6 +246,12 @@ def rate_logic_to_rate_by(rate_logic: object) -> str:
     return ""
 
 
+def _bracket_upper_label(number: float) -> str | int:
+    if number == int(number):
+        return int(number)
+    return f"{number:g}"
+
+
 def weight_bracket_label(chargeable_weight: object) -> str:
     text = cell_text(chargeable_weight)
     if not text:
@@ -253,21 +259,25 @@ def weight_bracket_label(chargeable_weight: object) -> str:
 
     range_match = WEIGHT_RANGE_PATTERN.match(text)
     if range_match:
-        upper = int(range_match.group(2))
+        upper = _bracket_upper_label(float(range_match.group(2)))
         return f"<={upper}"
 
     try:
-        upper = int(float(text))
+        upper = _bracket_upper_label(float(text.replace(",", "")))
     except ValueError:
         return text
     return f"<={upper}"
 
 
-def bracket_sort_key(label: str) -> tuple[int, int | str]:
-    match = re.match(r"^<=(\d+)$", label)
+def bracket_sort_key(label: str) -> tuple[int, float | str]:
+    match = re.match(r"^<=(.+)$", label)
     if match:
-        return (0, int(match.group(1)))
-    return (1, label)
+        upper_text = match.group(1)
+        try:
+            return (0, float(upper_text))
+        except ValueError:
+            return (1, upper_text)
+    return (2, label)
 
 
 def transport_cost_column_name(bracket_label: str) -> str:
@@ -1253,30 +1263,8 @@ def lane_key(
     return (origin, destination, destination_postal_code, shipment_type, stream_id)
 
 
-def _is_first_weight_bracket(chargeable_weight: object) -> bool:
-    return weight_bracket_label(chargeable_weight) == "<=1"
-
-
-def iter_rate_blocks(source_df: pd.DataFrame) -> list[pd.DataFrame]:
-    """Split a tab into consecutive rate blocks that restart at weight bracket 1."""
-    blocks: list[list[pd.Series]] = []
-    current_block: list[pd.Series] = []
-
-    for _, row in source_df.iterrows():
-        if current_block and _is_first_weight_bracket(row.get("Chargeable Weight")):
-            blocks.append(current_block)
-            current_block = []
-        current_block.append(row)
-
-    if current_block:
-        blocks.append(current_block)
-
-    return [pd.DataFrame(block_rows) for block_rows in blocks]
-
-
-def block_stream_id(block_df: pd.DataFrame) -> str:
-    first_row = block_df.iloc[0]
-    return cell_text(first_row.get("Service Level")) or cell_text(first_row.get("Shipment Type"))
+def row_service_level(source_row: pd.Series) -> str:
+    return cell_text(source_row.get("Service Level")) or cell_text(source_row.get("Shipment Type"))
 
 
 def build_shipment_and_cost_rows(
@@ -1291,80 +1279,75 @@ def build_shipment_and_cost_rows(
     for tab_name, source_df in rate_tabs:
         dest_columns = destination_rate_columns(source_df, puk_mode=puk_mode)
 
-        for block_df in iter_rate_blocks(source_df):
-            if block_df.empty:
+        for _, source_row in source_df.iterrows():
+            bracket = weight_bracket_label(source_row.get("Chargeable Weight"))
+            if not bracket:
                 continue
 
-            stream_id = block_stream_id(block_df)
+            origin = cell_text(source_row.get("Origin"))
+            shipment_type = cell_text(source_row.get("Shipment Type"))
+            service_level = row_service_level(source_row)
+            default_destination_iso = cell_text(source_row.get("Destination ISO"))
+            use_sfs_cost = is_sfs_tab(tab_name)
+            cost_column = (
+                sfs_transport_cost_column_name(bracket)
+                if use_sfs_cost
+                else transport_cost_column_name(bracket)
+            )
 
-            for _, source_row in block_df.iterrows():
-                bracket = weight_bracket_label(source_row.get("Chargeable Weight"))
-                if not bracket:
+            for dest_column in dest_columns:
+                rate = rate_value(source_row.get(dest_column))
+                if rate is None:
                     continue
 
-                origin = cell_text(source_row.get("Origin"))
-                shipment_type = cell_text(source_row.get("Shipment Type"))
-                default_destination_iso = cell_text(source_row.get("Destination ISO"))
-                use_sfs_cost = is_sfs_tab(tab_name)
-                cost_column = (
-                    sfs_transport_cost_column_name(bracket)
-                    if use_sfs_cost
-                    else transport_cost_column_name(bracket)
-                )
-
-                for dest_column in dest_columns:
-                    rate = rate_value(source_row.get(dest_column))
-                    if rate is None:
-                        continue
-
-                    if puk_mode:
-                        destination_country, destination_postal_code = parse_puk_destination_column(
-                            dest_column,
-                            default_destination_iso=default_destination_iso,
-                        )
-                    else:
-                        destination_country = dest_column
-                        destination_postal_code = ""
-
-                    key = lane_key(
-                        origin,
-                        destination_country,
-                        shipment_type,
-                        stream_id,
-                        tab_name=tab_name,
-                        destination_postal_code=destination_postal_code,
+                if puk_mode:
+                    destination_country, destination_postal_code = parse_puk_destination_column(
+                        dest_column,
+                        default_destination_iso=default_destination_iso,
                     )
-                    if key not in lanes:
-                        lanes[key] = {
-                            "Tab": tab_name,
-                            "Origin country": origin,
-                            "Shipment Type": shipment_type,
-                            "Service": "",
-                            "Service level": stream_id,
-                            "Destination country": destination_country,
-                            "Destination Postal Code": destination_postal_code,
-                            "Carrier Account number": "",
-                            "Business Segment": "",
-                            "Category": "",
-                            "Shipping Condition": "",
-                            "Valid from": format_display_date(source_row.get("Version Date")),
-                            "Valid to": "",
-                            CURRENCY_COLUMN: cell_text(source_row.get("Billing Currency")).upper(),
-                            **{column: None for column in transport_columns},
-                        }
+                else:
+                    destination_country = dest_column
+                    destination_postal_code = ""
 
-                    lane = lanes[key]
-                    if not lane["Valid from"]:
-                        lane["Valid from"] = format_display_date(source_row.get("Version Date"))
-                    if not lane[CURRENCY_COLUMN]:
-                        lane[CURRENCY_COLUMN] = cell_text(source_row.get("Billing Currency")).upper()
+                key = lane_key(
+                    origin,
+                    destination_country,
+                    shipment_type,
+                    service_level,
+                    tab_name=tab_name,
+                    destination_postal_code=destination_postal_code,
+                )
+                if key not in lanes:
+                    lanes[key] = {
+                        "Tab": tab_name,
+                        "Origin country": origin,
+                        "Shipment Type": shipment_type,
+                        "Service": "",
+                        "Service level": service_level,
+                        "Destination country": destination_country,
+                        "Destination Postal Code": destination_postal_code,
+                        "Carrier Account number": "",
+                        "Business Segment": "",
+                        "Category": "",
+                        "Shipping Condition": "",
+                        "Valid from": format_display_date(source_row.get("Version Date")),
+                        "Valid to": "",
+                        CURRENCY_COLUMN: cell_text(source_row.get("Billing Currency")).upper(),
+                        **{column: None for column in transport_columns},
+                    }
 
-                    existing_rate = lane.get(cost_column)
-                    if existing_rate is not None and existing_rate != rate:
-                        raise ValueError(
-                            f"Conflicting rates for lane {key} at {bracket}: {existing_rate} vs {rate}"
-                        )
-                    lane[cost_column] = rate
+                lane = lanes[key]
+                if not lane["Valid from"]:
+                    lane["Valid from"] = format_display_date(source_row.get("Version Date"))
+                if not lane[CURRENCY_COLUMN]:
+                    lane[CURRENCY_COLUMN] = cell_text(source_row.get("Billing Currency")).upper()
+
+                existing_rate = lane.get(cost_column)
+                if existing_rate is not None and existing_rate != rate:
+                    raise ValueError(
+                        f"Conflicting rates for lane {key} at {bracket}: {existing_rate} vs {rate}"
+                    )
+                lane[cost_column] = rate
 
     if not lanes:
         return pd.DataFrame(columns=[*SHIPMENT_COLUMNS, CURRENCY_COLUMN, *transport_columns])
