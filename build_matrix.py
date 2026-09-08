@@ -1257,10 +1257,23 @@ def lane_key(
     *,
     tab_name: str = "",
     destination_postal_code: str = "",
+    service: str = "",
 ) -> tuple[str, ...]:
     if is_sfs_tab(tab_name):
-        return (tab_name, origin, destination, destination_postal_code, shipment_type, stream_id)
-    return (origin, destination, destination_postal_code, shipment_type, stream_id)
+        return (
+            tab_name,
+            origin,
+            destination,
+            destination_postal_code,
+            shipment_type,
+            service,
+            stream_id,
+        )
+    return (origin, destination, destination_postal_code, shipment_type, service, stream_id)
+
+
+def row_service(source_row: pd.Series) -> str:
+    return cell_text(source_row.get("Service"))
 
 
 def row_service_level(source_row: pd.Series) -> str:
@@ -1286,6 +1299,7 @@ def build_shipment_and_cost_rows(
 
             origin = cell_text(source_row.get("Origin"))
             shipment_type = cell_text(source_row.get("Shipment Type"))
+            service = row_service(source_row)
             service_level = row_service_level(source_row)
             default_destination_iso = cell_text(source_row.get("Destination ISO"))
             use_sfs_cost = is_sfs_tab(tab_name)
@@ -1316,6 +1330,7 @@ def build_shipment_and_cost_rows(
                     service_level,
                     tab_name=tab_name,
                     destination_postal_code=destination_postal_code,
+                    service=service,
                 )
                 if key not in lanes:
                     lanes[key] = {
