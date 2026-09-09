@@ -24,8 +24,6 @@ ROOT = _DEFAULT_ROOT
 INPUT_DIR = ROOT / "input"
 PROCESSING_DIR = ROOT / "processing"
 OUTPUT_DIR = ROOT / "output"
-US_PROCESSING_DIR = PROCESSING_DIR / "us"
-US_OUTPUT_DIR = OUTPUT_DIR / "us"
 
 COLAB_DRIVE_BASE = Path(
     "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team "
@@ -63,11 +61,9 @@ def configure_paths(
     input_dir: Path | str | None = None,
     processing_dir: Path | str | None = None,
     output_dir: Path | str | None = None,
-    us_processing_dir: Path | str | None = None,
-    us_output_dir: Path | str | None = None,
 ) -> None:
     """Override data folder locations (for Colab / Google Drive)."""
-    global ROOT, INPUT_DIR, PROCESSING_DIR, OUTPUT_DIR, US_PROCESSING_DIR, US_OUTPUT_DIR
+    global ROOT, INPUT_DIR, PROCESSING_DIR, OUTPUT_DIR
 
     if root is not None:
         ROOT = Path(root).expanduser().resolve()
@@ -77,14 +73,6 @@ def configure_paths(
         PROCESSING_DIR = Path(processing_dir).expanduser().resolve()
     if output_dir is not None:
         OUTPUT_DIR = Path(output_dir).expanduser().resolve()
-    if us_processing_dir is not None:
-        US_PROCESSING_DIR = Path(us_processing_dir).expanduser().resolve()
-    elif processing_dir is not None:
-        US_PROCESSING_DIR = PROCESSING_DIR / "us"
-    if us_output_dir is not None:
-        US_OUTPUT_DIR = Path(us_output_dir).expanduser().resolve()
-    elif output_dir is not None:
-        US_OUTPUT_DIR = OUTPUT_DIR / "us"
 
 
 def configure_paths_from_env() -> None:
@@ -117,8 +105,6 @@ def ensure_workspace_dirs() -> None:
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    US_PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-    US_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def print_path_config() -> None:
@@ -130,5 +116,3 @@ def print_path_config() -> None:
     print(f"  Input:      {INPUT_DIR}")
     print(f"  Processing: {PROCESSING_DIR}")
     print(f"  Output:     {OUTPUT_DIR}")
-    print(f"  US proc.:   {US_PROCESSING_DIR}")
-    print(f"  US output:  {US_OUTPUT_DIR}")
