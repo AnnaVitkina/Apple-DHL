@@ -280,8 +280,63 @@ def bracket_sort_key(label: str) -> tuple[int, float | str]:
     return (2, label)
 
 
-def transport_cost_column_name(bracket_label: str) -> str:
-    return f"{TRANSPORT_COST_GROUP} ({bracket_label})"
+def bracket_upper_bound(label: str) -> float | None:
+    match = re.match(r"^<=(.+)$", label)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def is_weight_ladder_continuation(previous_bracket: str, bracket: str) -> bool:
+    previous_upper = bracket_upper_bound(previous_bracket)
+    current_upper = bracket_upper_bound(bracket)
+    if previous_upper is None or current_upper is None:
+        return False
+    return current_upper > previous_upper
+
+
+STANDARD_TRANSPORT_COST_PATTERN = re.compile(
+    rf"^{re.escape(TRANSPORT_COST_GROUP)} \((.+)\) \((.+)\)$"
+)
+
+
+def transport_cost_column_name(tab_name: str, bracket_label: str) -> str:
+    return f"{TRANSPORT_COST_GROUP} ({tab_name}) ({bracket_label})"
+
+
+def parse_standard_transport_cost_column(column_name: str) -> tuple[str, str] | None:
+    match = STANDARD_TRANSPORT_COST_PATTERN.match(column_name)
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
+def group_standard_transport_columns(
+    standard_columns: list[str],
+) -> list[tuple[str, list[str]]]:
+    groups: list[tuple[str, list[str]]] = []
+    current_tab = ""
+    current_columns: list[str] = []
+
+    for column in standard_columns:
+        parsed = parse_standard_transport_cost_column(column)
+        if parsed is None:
+            continue
+        tab_name, _ = parsed
+        if tab_name != current_tab:
+            if current_columns:
+                groups.append((current_tab, current_columns))
+            current_tab = tab_name
+            current_columns = [column]
+        else:
+            current_columns.append(column)
+
+    if current_columns:
+        groups.append((current_tab, current_columns))
+    return groups
 
 
 def sfs_transport_cost_column_name(bracket_label: str) -> str:
@@ -293,8 +348,9 @@ def is_sfs_tab(tab_name: str) -> bool:
 
 
 def is_standard_weight_bracket_cost_column(column_name: str) -> bool:
-    prefix = f"{TRANSPORT_COST_GROUP} ("
-    return column_name.startswith(prefix) and not column_name.startswith(f"{SFS_TRANSPORT_COST_GROUP} (")
+    if column_name.startswith(f"{SFS_TRANSPORT_COST_GROUP} ("):
+        return False
+    return parse_standard_transport_cost_column(column_name) is not None
 
 
 def is_sfs_weight_bracket_cost_column(column_name: str) -> bool:
@@ -1208,6 +1264,33 @@ def enrich_matrix_with_tab_index(
     return finalize_lane_numbers(result)
 
 
+def collect_weight_brackets_from_df(
+    source_df: pd.DataFrame,
+    *,
+    scope: str = "Transport cost",
+) -> tuple[list[str], dict[str, str]]:
+    brackets: set[str] = set()
+    bracket_rate_by: dict[str, str] = {}
+
+    for _, row in source_df.iterrows():
+        bracket = weight_bracket_label(row.get("Chargeable Weight"))
+        if not bracket:
+            continue
+        brackets.add(bracket)
+        rate_by = rate_logic_to_rate_by(row.get("Rate Logic"))
+        if rate_by:
+            existing = bracket_rate_by.get(bracket)
+            if existing and existing != rate_by:
+                raise ValueError(
+                    f"{scope} weight bracket {bracket} has conflicting rate logic: "
+                    f"{existing} vs {rate_by}"
+                )
+            bracket_rate_by[bracket] = rate_by
+
+    ordered = sorted(brackets, key=bracket_sort_key)
+    return ordered, bracket_rate_by
+
+
 def collect_weight_brackets(
     rate_tabs: list[tuple[str, pd.DataFrame]],
     *,
@@ -1219,21 +1302,20 @@ def collect_weight_brackets(
     for tab_name, source_df in rate_tabs:
         if is_sfs_tab(tab_name) != sfs_only:
             continue
-        for _, row in source_df.iterrows():
-            bracket = weight_bracket_label(row.get("Chargeable Weight"))
-            if not bracket:
-                continue
-            brackets.add(bracket)
-            rate_by = rate_logic_to_rate_by(row.get("Rate Logic"))
-            if rate_by:
-                existing = bracket_rate_by.get(bracket)
-                if existing and existing != rate_by:
-                    scope = "SFS" if sfs_only else "Transport cost"
-                    raise ValueError(
-                        f"{scope} weight bracket {bracket} has conflicting rate logic: "
-                        f"{existing} vs {rate_by}"
-                    )
-                bracket_rate_by[bracket] = rate_by
+        tab_brackets, tab_rate_by = collect_weight_brackets_from_df(
+            source_df,
+            scope="SFS" if sfs_only else "Transport cost",
+        )
+        brackets.update(tab_brackets)
+        for bracket, rate_by in tab_rate_by.items():
+            existing = bracket_rate_by.get(bracket)
+            if existing and existing != rate_by:
+                scope = "SFS" if sfs_only else "Transport cost"
+                raise ValueError(
+                    f"{scope} weight bracket {bracket} has conflicting rate logic: "
+                    f"{existing} vs {rate_by}"
+                )
+            bracket_rate_by[bracket] = rate_by
 
     ordered = sorted(brackets, key=bracket_sort_key)
     return ordered, bracket_rate_by
@@ -1242,9 +1324,29 @@ def collect_weight_brackets(
 def collect_transport_cost_columns(
     rate_tabs: list[tuple[str, pd.DataFrame]],
 ) -> tuple[list[str], list[str], dict[str, str], dict[str, str]]:
-    weight_brackets, bracket_rate_by = collect_weight_brackets(rate_tabs, sfs_only=False)
+    standard_columns: list[str] = []
+    bracket_rate_by: dict[str, str] = {}
+
+    for tab_name, source_df in rate_tabs:
+        if is_sfs_tab(tab_name):
+            continue
+        weight_brackets, tab_bracket_rate_by = collect_weight_brackets_from_df(
+            source_df,
+            scope=f"Transport cost ({tab_name})",
+        )
+        standard_columns.extend(
+            transport_cost_column_name(tab_name, bracket) for bracket in weight_brackets
+        )
+        for bracket, rate_by in tab_bracket_rate_by.items():
+            existing = bracket_rate_by.get(bracket)
+            if existing and existing != rate_by:
+                raise ValueError(
+                    f"Transport cost weight bracket {bracket} has conflicting rate logic: "
+                    f"{existing} vs {rate_by}"
+                )
+            bracket_rate_by[bracket] = rate_by
+
     sfs_brackets, sfs_bracket_rate_by = collect_weight_brackets(rate_tabs, sfs_only=True)
-    standard_columns = [transport_cost_column_name(bracket) for bracket in weight_brackets]
     sfs_columns = [sfs_transport_cost_column_name(bracket) for bracket in sfs_brackets]
     return standard_columns, sfs_columns, bracket_rate_by, sfs_bracket_rate_by
 
@@ -1259,17 +1361,15 @@ def lane_key(
     destination_postal_code: str = "",
     service: str = "",
 ) -> tuple[str, ...]:
-    if is_sfs_tab(tab_name):
-        return (
-            tab_name,
-            origin,
-            destination,
-            destination_postal_code,
-            shipment_type,
-            service,
-            stream_id,
-        )
-    return (origin, destination, destination_postal_code, shipment_type, service, stream_id)
+    return (
+        tab_name,
+        origin,
+        destination,
+        destination_postal_code,
+        shipment_type,
+        service,
+        stream_id,
+    )
 
 
 def row_service(source_row: pd.Series) -> str:
@@ -1291,6 +1391,8 @@ def build_shipment_and_cost_rows(
 
     for tab_name, source_df in rate_tabs:
         dest_columns = destination_rate_columns(source_df, puk_mode=puk_mode)
+        previous_bracket = ""
+        active_service_level = ""
 
         for _, source_row in source_df.iterrows():
             bracket = weight_bracket_label(source_row.get("Chargeable Weight"))
@@ -1300,13 +1402,20 @@ def build_shipment_and_cost_rows(
             origin = cell_text(source_row.get("Origin"))
             shipment_type = cell_text(source_row.get("Shipment Type"))
             service = row_service(source_row)
-            service_level = row_service_level(source_row)
+            row_service_level_value = row_service_level(source_row)
+            if previous_bracket and is_weight_ladder_continuation(previous_bracket, bracket):
+                service_level = active_service_level
+            else:
+                service_level = row_service_level_value
+                active_service_level = row_service_level_value
+            previous_bracket = bracket
+
             default_destination_iso = cell_text(source_row.get("Destination ISO"))
             use_sfs_cost = is_sfs_tab(tab_name)
             cost_column = (
                 sfs_transport_cost_column_name(bracket)
                 if use_sfs_cost
-                else transport_cost_column_name(bracket)
+                else transport_cost_column_name(tab_name, bracket)
             )
 
             for dest_column in dest_columns:
@@ -1503,34 +1612,53 @@ def write_matrix_sheet(
     sfs_bracket_rate_by: dict[str, str] | None = None,
     sheet_name: str = "Rate card",
     ra_filled_cells: set[tuple[int, str]] | None = None,
+    shipment_columns: tuple[str, ...] | None = None,
 ) -> None:
     worksheet = workbook.active
     worksheet.title = sheet_name
     sfs_bracket_rate_by = sfs_bracket_rate_by or {}
     ra_filled_cells = ra_filled_cells or set()
+    shipment_headers = shipment_columns or SHIPMENT_COLUMNS
 
     standard_columns = [
         column for column in matrix_df.columns if is_standard_weight_bracket_cost_column(column)
     ]
     sfs_columns = [column for column in matrix_df.columns if is_sfs_weight_bracket_cost_column(column)]
-    shipment_count = len(SHIPMENT_COLUMNS)
+    tab_transport_groups = group_standard_transport_columns(standard_columns)
+    shipment_count = len(shipment_headers)
     currency_col = shipment_count + 1
-    standard_start_col = shipment_count + 2
-    standard_end_col = shipment_count + 1 + len(standard_columns)
-    sfs_start_col = standard_end_col + 1
-    sfs_end_col = standard_end_col + len(sfs_columns)
 
-    if standard_columns:
+    cost_column_positions: dict[str, int] = {}
+    next_col = currency_col + 1
+    for _, group_columns in tab_transport_groups:
+        for cost_column in group_columns:
+            cost_column_positions[cost_column] = next_col
+            next_col += 1
+
+    sfs_start_col = next_col
+    sfs_end_col = sfs_start_col + len(sfs_columns) - 1 if sfs_columns else sfs_start_col - 1
+
+    header_start_col = currency_col
+    for group_index, (tab_name, group_columns) in enumerate(tab_transport_groups):
+        include_currency = group_index == 0
+        if include_currency:
+            start_col = header_start_col
+            end_col = start_col + len(group_columns)
+        else:
+            start_col = header_start_col
+            end_col = start_col + len(group_columns) - 1
+
         _write_transport_cost_group(
             worksheet,
-            start_col=currency_col,
-            end_col=standard_end_col,
-            group_title=f"Grouped cost: {TRANSPORT_COST_GROUP}",
-            cost_columns=standard_columns,
-            column_prefix=f"{TRANSPORT_COST_GROUP} (",
+            start_col=start_col,
+            end_col=end_col,
+            group_title=f"Grouped cost: Transport cost ({tab_name})",
+            cost_columns=group_columns,
+            column_prefix=f"Transport cost ({tab_name}) (",
             bracket_rate_by=bracket_rate_by,
-            include_currency=True,
+            include_currency=include_currency,
         )
+        header_start_col = end_col + 1
 
     if sfs_columns:
         _write_transport_cost_group(
@@ -1544,7 +1672,7 @@ def write_matrix_sheet(
             include_currency=False,
         )
 
-    for col_index, header in enumerate(SHIPMENT_COLUMNS, start=1):
+    for col_index, header in enumerate(shipment_headers, start=1):
         cell = worksheet.cell(COLUMN_HEADER_ROW, col_index, header)
         _style_header_cell(cell, bold=header == "Lane #")
 
@@ -1552,10 +1680,15 @@ def write_matrix_sheet(
         currency_header = worksheet.cell(COLUMN_HEADER_ROW, currency_col, CURRENCY_COLUMN)
         _style_header_cell(currency_header, center=True, fill=TRANSPORT_COST_FILL)
 
-        for offset, cost_column in enumerate(standard_columns, start=standard_start_col):
-            bracket_label = cost_column.removeprefix(f"{TRANSPORT_COST_GROUP} (").removesuffix(")")
+        for cost_column in standard_columns:
+            parsed = parse_standard_transport_cost_column(cost_column)
+            bracket_label = parsed[1] if parsed else ""
             rate_by = bracket_rate_by.get(bracket_label, "Rate")
-            header_cell = worksheet.cell(COLUMN_HEADER_ROW, offset, rate_by)
+            header_cell = worksheet.cell(
+                COLUMN_HEADER_ROW,
+                cost_column_positions[cost_column],
+                rate_by,
+            )
             _style_header_cell(header_cell, center=True, fill=TRANSPORT_COST_FILL)
 
     if sfs_columns:
@@ -1569,7 +1702,7 @@ def write_matrix_sheet(
     for matrix_index, (_, row) in enumerate(matrix_df.iterrows()):
         excel_row = DATA_START_ROW + matrix_index
 
-        for col_index, header in enumerate(SHIPMENT_COLUMNS, start=1):
+        for col_index, header in enumerate(shipment_headers, start=1):
             cell = worksheet.cell(excel_row, col_index, row.get(header))
             cell.alignment = LEFT
             cell.border = THIN_BORDER
@@ -1582,11 +1715,10 @@ def write_matrix_sheet(
             currency_cell.border = THIN_BORDER
 
         for cost_column in all_cost_columns:
-            offset = (
-                currency_col + 1 + standard_columns.index(cost_column)
-                if cost_column in standard_columns
-                else sfs_start_col + sfs_columns.index(cost_column)
-            )
+            if cost_column in standard_columns:
+                offset = cost_column_positions[cost_column]
+            else:
+                offset = sfs_start_col + sfs_columns.index(cost_column)
             value = row.get(cost_column)
             cell = worksheet.cell(excel_row, offset)
             cell.border = THIN_BORDER
@@ -1595,13 +1727,14 @@ def write_matrix_sheet(
                 cell.number_format = RATE_NUMBER_FORMAT
                 cell.alignment = CENTER
 
-    for col_index, header in enumerate(SHIPMENT_COLUMNS, start=1):
+    for col_index, header in enumerate(shipment_headers, start=1):
         worksheet.column_dimensions[get_column_letter(col_index)].width = _column_width_for_header(header)
 
     if standard_columns or sfs_columns:
         worksheet.column_dimensions[get_column_letter(currency_col)].width = 12.0
 
-    for offset, cost_column in enumerate(standard_columns, start=standard_start_col):
+    for cost_column in standard_columns:
+        offset = cost_column_positions[cost_column]
         worksheet.column_dimensions[get_column_letter(offset)].width = _column_width_for_header(cost_column)
 
     for offset, cost_column in enumerate(sfs_columns, start=sfs_start_col):
@@ -1619,6 +1752,7 @@ def save_matrix(
     sfs_bracket_rate_by: dict[str, str] | None = None,
     output_path: Path | None = None,
     ra_filled_cells: set[tuple[int, str]] | None = None,
+    shipment_columns: tuple[str, ...] | None = None,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if output_path is None:
@@ -1631,6 +1765,7 @@ def save_matrix(
         bracket_rate_by=bracket_rate_by,
         sfs_bracket_rate_by=sfs_bracket_rate_by,
         ra_filled_cells=ra_filled_cells,
+        shipment_columns=shipment_columns,
     )
     workbook.save(output_path)
     return output_path
