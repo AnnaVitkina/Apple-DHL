@@ -52,6 +52,16 @@ SHIPMENT_COLUMNS = (
     "Valid to",
 )
 
+LANE_MERGE_IDENTITY_COLUMNS = (
+    "Origin country",
+    "Shipment Type",
+    "Destination country",
+    "Carrier Account number",
+    "Business Segment",
+    "Valid from",
+    "Valid to",
+)
+
 CURRENCY_COLUMN = "Currency"
 TAB_INDEX_SHEET = "Tab Index"
 RETURN_DESCRIPTION_PATTERN = re.compile(r"shipments\s+back", re.IGNORECASE)
@@ -105,6 +115,7 @@ BUSINESS_SEGMENT_ABBREVIATIONS: dict[str, str] = {
 FIXED_SOURCE_COLUMNS = {
     "Version Number",
     "Version Date",
+    "Destination",
     "Destination Country",
     "Destination ISO",
     "Billing Currency",
@@ -116,6 +127,8 @@ FIXED_SOURCE_COLUMNS = {
     "Rate Logic",
     "Lane Code",
 }
+ACCOUNT_NUMBER_PATTERN = re.compile(r"\b\d{6,}\b")
+TAB_COUNTRY_PREFIX_PATTERN = re.compile(r"^([A-Z]{2})(?:_|$)")
 
 COST_GROUP_ROW = 1
 COST_NAME_ROW = 2
@@ -126,6 +139,7 @@ DATA_START_ROW = 6
 
 HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")
 RA_FILL_HIGHLIGHT = PatternFill("solid", fgColor="FFFF00")
+MERGE_CONFLICT_FILL = PatternFill("solid", fgColor="F4B183")
 TRANSPORT_GROUP_FILL = PatternFill("solid", fgColor="9BC2E6")
 TRANSPORT_COST_FILL = PatternFill("solid", fgColor="BDD7EE")
 COST_META_FILL = PatternFill("solid", fgColor="F2F2F2")
@@ -379,6 +393,21 @@ def _country_codes_in_text(value: object) -> list[str]:
     return ISO_TOKEN_PATTERN.findall(cell_text(value).upper())
 
 
+def country_code_from_tab_name(tab_name: str) -> str:
+    text = cell_text(tab_name).upper()
+    if not text:
+        return ""
+    if ISO_COLUMN_PATTERN.match(text):
+        return text
+    match = TAB_COUNTRY_PREFIX_PATTERN.match(text)
+    if match:
+        return match.group(1)
+    for prefix, country_code in TAB_PREFIX_TO_COUNTRY.items():
+        if text.startswith(prefix):
+            return country_code
+    return ""
+
+
 def resolve_lane_country_code(
     country_value: object,
     *,
@@ -386,26 +415,28 @@ def resolve_lane_country_code(
     tab_index_lookup: dict[str, TabIndexInfo] | None = None,
 ) -> str:
     text = cell_text(country_value)
-    if not text or text.lower() == "any":
-        return ""
+    if text and text.lower() != "any":
+        if ISO_COLUMN_PATTERN.match(text.upper()):
+            return text.upper()
 
-    for code in _country_codes_in_text(text):
-        if ISO_COLUMN_PATTERN.match(code):
-            return code
+        for code in _country_codes_in_text(text):
+            if ISO_COLUMN_PATTERN.match(code):
+                return code
 
-    for part in re.split(r"[,/;\s]+", text.upper()):
-        if not part:
-            continue
-        if part in DEPOT_TO_COUNTRY:
-            return DEPOT_TO_COUNTRY[part]
-        if LU_DEPOT_PATTERN.match(part):
-            return "LU"
-        if ISO_COLUMN_PATTERN.match(part):
-            return part
+        for part in re.split(r"[,/;\s]+", text.upper()):
+            if not part:
+                continue
+            if part in DEPOT_TO_COUNTRY:
+                return DEPOT_TO_COUNTRY[part]
+            if LU_DEPOT_PATTERN.match(part):
+                return "LU"
+            if ISO_COLUMN_PATTERN.match(part):
+                return part
 
     tab_name = cell_text(tab_name)
-    if ISO_COLUMN_PATTERN.match(tab_name):
-        return tab_name
+    from_tab = country_code_from_tab_name(tab_name)
+    if from_tab:
+        return from_tab
 
     if tab_index_lookup:
         tab_info = tab_index_lookup.get(tab_name)
@@ -417,11 +448,47 @@ def resolve_lane_country_code(
             if resolved:
                 return resolved
 
-    for prefix, country_code in TAB_PREFIX_TO_COUNTRY.items():
-        if tab_name.upper().startswith(prefix):
-            return country_code
-
     return ""
+
+
+def resolve_matrix_origin_country(
+    origin_value: object,
+    *,
+    tab_name: str,
+) -> str:
+    """Use a simple 2-letter ISO origin as-is; otherwise take country from tab name."""
+    text = cell_text(origin_value).upper()
+    if ISO_COLUMN_PATTERN.match(text):
+        return text
+    from_tab = country_code_from_tab_name(tab_name)
+    if from_tab:
+        return from_tab
+    return resolve_lane_country_code(origin_value, tab_name=tab_name)
+
+
+def resolve_import_destination_country(
+    source_row: pd.Series,
+    *,
+    tab_name: str,
+) -> str:
+    for field_name in ("Destination ISO", "Destination", "Destination Country"):
+        value = cell_text(source_row.get(field_name)).upper()
+        if not value:
+            continue
+        if ISO_COLUMN_PATTERN.match(value):
+            return value
+        for code in _country_codes_in_text(value):
+            if ISO_COLUMN_PATTERN.match(code):
+                return code
+    return country_code_from_tab_name(tab_name)
+
+
+def is_import_rate_tab(df: pd.DataFrame) -> bool:
+    return (
+        "Origin" not in df.columns
+        and {"Chargeable Weight", "Rate Logic"}.issubset(df.columns)
+        and bool(destination_iso_columns(df))
+    )
 
 
 def spl_service_for_lane(origin: str, destination: str) -> str:
@@ -608,10 +675,11 @@ def is_rate_tab(
         tab_info = tab_index_lookup.get(sheet_name)
         if tab_info is None or not tab_info.is_active:
             return False
-    required = {"Origin", "Chargeable Weight", "Rate Logic"}
-    if not required.issubset(df.columns):
+    if not {"Chargeable Weight", "Rate Logic"}.issubset(df.columns):
         return False
-    return bool(destination_rate_columns(df, puk_mode=puk_mode))
+    if "Origin" in df.columns:
+        return bool(destination_rate_columns(df, puk_mode=puk_mode))
+    return is_import_rate_tab(df)
 
 
 def list_extracted_files() -> list[Path]:
@@ -704,9 +772,15 @@ class RaLaneEntry:
 
 
 def normalize_billing_accounts(value: object) -> str:
-    text = cell_text(value).replace("\n", " ")
-    parts = [part.strip() for part in re.split(r"\s*;\s*", text) if part.strip()]
-    return "; ".join(parts)
+    text = cell_text(value)
+    accounts: list[str] = []
+    seen: set[str] = set()
+    for account in ACCOUNT_NUMBER_PATTERN.findall(text):
+        if account in seen:
+            continue
+        seen.add(account)
+        accounts.append(account)
+    return "; ".join(accounts)
 
 
 def billing_bs_file_path() -> Path | None:
@@ -842,6 +916,141 @@ def service_level_tokens(value: object) -> frozenset[str]:
         for token in re.split(r"[,/;\s]+", cell_text(value).upper())
         if token
     )
+
+
+def service_tokens(value: object) -> frozenset[str]:
+    return frozenset(
+        token
+        for token in re.split(r"[,/;\s]+", cell_text(value).upper())
+        if token
+    )
+
+
+def _normalized_merge_identity_value(value: object) -> str:
+    text = cell_text(value)
+    if text.lower() == "nan":
+        return ""
+    return text
+
+
+def _lane_has_cost_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, float) and pd.isna(value):
+        return False
+    return cell_text(value) != ""
+
+
+def _filled_cost_columns(row: pd.Series, cost_columns: list[str]) -> set[str]:
+    return {column for column in cost_columns if _lane_has_cost_value(row.get(column))}
+
+
+def _service_fields_cover(keeper: pd.Series, other: pd.Series) -> bool:
+    return (
+        service_tokens(other.get("Service")) <= service_tokens(keeper.get("Service"))
+        and service_level_tokens(other.get("Service level"))
+        <= service_level_tokens(keeper.get("Service level"))
+    )
+
+
+def _costs_overlap(left: pd.Series, right: pd.Series, cost_columns: list[str]) -> bool:
+    return bool(_filled_cost_columns(left, cost_columns) & _filled_cost_columns(right, cost_columns))
+
+
+def _merge_lane_costs_into(
+    keeper: dict[str, object],
+    other: pd.Series,
+    cost_columns: list[str],
+) -> None:
+    for column in cost_columns:
+        if _lane_has_cost_value(keeper.get(column)):
+            continue
+        if _lane_has_cost_value(other.get(column)):
+            keeper[column] = other.get(column)
+
+
+def merge_compatible_lanes(
+    matrix_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[int]]:
+    """Merge lanes with the same identity when services nest and costs do not overlap.
+
+    Returns the merged matrix and 0-based row indices that could not be merged
+    (highlighted in orange in the Excel output).
+    """
+    if matrix_df.empty or len(matrix_df) < 2:
+        return matrix_df, set()
+
+    identity_columns = [
+        column for column in LANE_MERGE_IDENTITY_COLUMNS if column in matrix_df.columns
+    ]
+    if not identity_columns:
+        return matrix_df, set()
+
+    cost_columns = [
+        column
+        for column in matrix_df.columns
+        if is_standard_weight_bracket_cost_column(column)
+        or is_sfs_weight_bracket_cost_column(column)
+    ]
+    working = matrix_df.copy().reset_index(drop=True)
+    for column in identity_columns:
+        working[column] = working[column].map(_normalized_merge_identity_value)
+
+    merged_rows: list[dict[str, object]] = []
+    conflict_row_indices: set[int] = set()
+
+    for _, group in working.groupby(identity_columns, dropna=False, sort=False):
+        rows = [row.to_dict() for _, row in group.iterrows()]
+        changed = True
+        while changed and len(rows) > 1:
+            changed = False
+            for left_index, left in enumerate(rows):
+                left_series = pd.Series(left)
+                for right_offset, right in enumerate(rows[left_index + 1 :], start=left_index + 1):
+                    right_series = pd.Series(right)
+                    left_covers = _service_fields_cover(left_series, right_series)
+                    right_covers = _service_fields_cover(right_series, left_series)
+                    if not left_covers and not right_covers:
+                        continue
+                    if _costs_overlap(left_series, right_series, cost_columns):
+                        continue
+                    if left_covers:
+                        _merge_lane_costs_into(left, right_series, cost_columns)
+                        rows.pop(right_offset)
+                    else:
+                        _merge_lane_costs_into(right, left_series, cost_columns)
+                        rows.pop(left_index)
+                    changed = True
+                    break
+                if changed:
+                    break
+
+        start_index = len(merged_rows)
+        merged_rows.extend(rows)
+        # Highlight only remaining siblings that nest on Service/Service level
+        # but could not be merged (typically because costs overlap).
+        for left_offset, left in enumerate(rows):
+            left_series = pd.Series(left)
+            for right_offset, right in enumerate(rows[left_offset + 1 :], start=left_offset + 1):
+                right_series = pd.Series(right)
+                if (
+                    _service_fields_cover(left_series, right_series)
+                    or _service_fields_cover(right_series, left_series)
+                ):
+                    conflict_row_indices.add(start_index + left_offset)
+                    conflict_row_indices.add(start_index + right_offset)
+
+    result = pd.DataFrame(merged_rows)
+    if result.empty:
+        return result, set()
+
+    # Preserve original column order where possible.
+    columns = [column for column in matrix_df.columns if column in result.columns]
+    for column in result.columns:
+        if column not in columns:
+            columns.append(column)
+    result = finalize_lane_numbers(result[columns])
+    return result, conflict_row_indices
 
 
 def service_level_match_score(
@@ -1390,7 +1599,8 @@ def build_shipment_and_cost_rows(
     lanes: dict[tuple[str, ...], dict[str, object]] = {}
 
     for tab_name, source_df in rate_tabs:
-        dest_columns = destination_rate_columns(source_df, puk_mode=puk_mode)
+        rate_columns = destination_rate_columns(source_df, puk_mode=puk_mode)
+        import_mode = is_import_rate_tab(source_df)
         previous_bracket = ""
         active_service_level = ""
 
@@ -1399,7 +1609,6 @@ def build_shipment_and_cost_rows(
             if not bracket:
                 continue
 
-            origin = cell_text(source_row.get("Origin"))
             shipment_type = cell_text(source_row.get("Shipment Type"))
             service = row_service(source_row)
             row_service_level_value = row_service_level(source_row)
@@ -1411,6 +1620,19 @@ def build_shipment_and_cost_rows(
             previous_bracket = bracket
 
             default_destination_iso = cell_text(source_row.get("Destination ISO"))
+            import_destination = (
+                resolve_import_destination_country(source_row, tab_name=tab_name)
+                if import_mode
+                else ""
+            )
+            export_origin = (
+                ""
+                if import_mode
+                else resolve_matrix_origin_country(
+                    source_row.get("Origin"),
+                    tab_name=tab_name,
+                )
+            )
             use_sfs_cost = is_sfs_tab(tab_name)
             cost_column = (
                 sfs_transport_cost_column_name(bracket)
@@ -1418,18 +1640,24 @@ def build_shipment_and_cost_rows(
                 else transport_cost_column_name(tab_name, bracket)
             )
 
-            for dest_column in dest_columns:
-                rate = rate_value(source_row.get(dest_column))
+            for rate_column in rate_columns:
+                rate = rate_value(source_row.get(rate_column))
                 if rate is None:
                     continue
 
-                if puk_mode:
+                if import_mode:
+                    origin = cell_text(rate_column).upper()
+                    destination_country = import_destination
+                    destination_postal_code = ""
+                elif puk_mode:
+                    origin = export_origin
                     destination_country, destination_postal_code = parse_puk_destination_column(
-                        dest_column,
+                        rate_column,
                         default_destination_iso=default_destination_iso,
                     )
                 else:
-                    destination_country = dest_column
+                    origin = export_origin
+                    destination_country = rate_column
                     destination_postal_code = ""
 
                 key = lane_key(
@@ -1613,11 +1841,13 @@ def write_matrix_sheet(
     sheet_name: str = "Rate card",
     ra_filled_cells: set[tuple[int, str]] | None = None,
     shipment_columns: tuple[str, ...] | None = None,
+    conflict_row_indices: set[int] | None = None,
 ) -> None:
     worksheet = workbook.active
     worksheet.title = sheet_name
     sfs_bracket_rate_by = sfs_bracket_rate_by or {}
     ra_filled_cells = ra_filled_cells or set()
+    conflict_row_indices = conflict_row_indices or set()
     shipment_headers = shipment_columns or SHIPMENT_COLUMNS
 
     standard_columns = [
@@ -1701,18 +1931,23 @@ def write_matrix_sheet(
     all_cost_columns = [*standard_columns, *sfs_columns]
     for matrix_index, (_, row) in enumerate(matrix_df.iterrows()):
         excel_row = DATA_START_ROW + matrix_index
+        is_conflict_row = matrix_index in conflict_row_indices
 
         for col_index, header in enumerate(shipment_headers, start=1):
             cell = worksheet.cell(excel_row, col_index, row.get(header))
             cell.alignment = LEFT
             cell.border = THIN_BORDER
-            if (matrix_index, header) in ra_filled_cells:
+            if is_conflict_row:
+                cell.fill = MERGE_CONFLICT_FILL
+            elif (matrix_index, header) in ra_filled_cells:
                 cell.fill = RA_FILL_HIGHLIGHT
 
         if standard_columns or sfs_columns:
             currency_cell = worksheet.cell(excel_row, currency_col, row.get(CURRENCY_COLUMN))
             currency_cell.alignment = CENTER
             currency_cell.border = THIN_BORDER
+            if is_conflict_row:
+                currency_cell.fill = MERGE_CONFLICT_FILL
 
         for cost_column in all_cost_columns:
             if cost_column in standard_columns:
@@ -1722,6 +1957,8 @@ def write_matrix_sheet(
             value = row.get(cost_column)
             cell = worksheet.cell(excel_row, offset)
             cell.border = THIN_BORDER
+            if is_conflict_row:
+                cell.fill = MERGE_CONFLICT_FILL
             if value is not None and value != "":
                 cell.value = value
                 cell.number_format = RATE_NUMBER_FORMAT
@@ -1753,6 +1990,7 @@ def save_matrix(
     output_path: Path | None = None,
     ra_filled_cells: set[tuple[int, str]] | None = None,
     shipment_columns: tuple[str, ...] | None = None,
+    conflict_row_indices: set[int] | None = None,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if output_path is None:
@@ -1766,6 +2004,7 @@ def save_matrix(
         sfs_bracket_rate_by=sfs_bracket_rate_by,
         ra_filled_cells=ra_filled_cells,
         shipment_columns=shipment_columns,
+        conflict_row_indices=conflict_row_indices,
     )
     workbook.save(output_path)
     return output_path
@@ -1817,6 +2056,14 @@ def run_build_matrix(
                 f"  FR Time Definite postal lanes added: {added} "
                 f"(Destination Postal Code {FR_TIME_DEFINITE_POSTAL_CODE})"
             )
+
+    before_merge_count = len(matrix_df)
+    matrix_df, conflict_row_indices = merge_compatible_lanes(matrix_df)
+    merged_away = before_merge_count - len(matrix_df)
+    if merged_away:
+        print(f"  Compatible lanes merged: {merged_away}")
+    if conflict_row_indices:
+        print(f"  Unmerged sibling lanes highlighted orange: {len(conflict_row_indices)}")
 
     ra_filled_cells: set[tuple[int, str]] = set()
     ra_file = select_ra_file(list_ra_files(), auto=auto)
@@ -1885,6 +2132,7 @@ def run_build_matrix(
         sfs_bracket_rate_by=sfs_bracket_rate_by,
         output_path=output_path,
         ra_filled_cells=ra_filled_cells,
+        conflict_row_indices=conflict_row_indices,
     )
     if puk_mode:
         from build_postal_code_zones import run_build_postal_code_zones
