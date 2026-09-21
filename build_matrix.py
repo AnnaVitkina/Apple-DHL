@@ -147,7 +147,7 @@ BOLD = Font(bold=True)
 NORMAL = Font()
 LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-RATE_NUMBER_FORMAT = "#,##0.00"
+RATE_NUMBER_FORMAT = "0.00"
 THIN_BORDER = Border(
     left=Side(style="thin", color="B4B4B4"),
     right=Side(style="thin", color="B4B4B4"),
@@ -497,8 +497,17 @@ def spl_service_for_lane(origin: str, destination: str) -> str:
     return "SPRINTLINE (DHL EXP NL)"
 
 
+def _normalize_domestic_country(country_code: str) -> str:
+    code = cell_text(country_code).upper()
+    if code == "IC":
+        return "ES"
+    return code
+
+
 def _dom_exp_service_applicable(origin: str, destination: str) -> bool:
-    return bool(origin) and origin == destination
+    if not origin or not destination:
+        return False
+    return _normalize_domestic_country(origin) == _normalize_domestic_country(destination)
 
 
 def _ecx_exp_service_applicable(origin: str, destination: str) -> bool:
@@ -596,11 +605,14 @@ def apply_service_column(
             tab_index_lookup=tab_index_lookup,
         )
         destination = resolve_lane_country_code(row.get("Destination country"))
-        result.at[index, "Service"] = resolve_service_column(
+        service = resolve_service_column(
             row.get("Service level"),
             origin,
             destination,
         )
+        if not service and _dom_exp_service_applicable(origin, destination):
+            service = "EXP_DOM"
+        result.at[index, "Service"] = service
     return result
 
 
