@@ -66,6 +66,11 @@ CURRENCY_COLUMN = "Currency"
 TAB_INDEX_SHEET = "Tab Index"
 RETURN_DESCRIPTION_PATTERN = re.compile(r"shipments\s+back", re.IGNORECASE)
 RETURN_CATEGORY = "return"
+NOT_RETURN_CATEGORY = "not return"
+PM_SHIPPING_CONDITION = "PM"
+NOT_PM_SHIPPING_CONDITION = "not PM"
+BILLING_RETURN_DIRECTIONS = frozenset({"return", "rma"})
+NSR_TOKEN_PATTERN = re.compile(r"\bNSR\b", re.IGNORECASE)
 
 TRANSPORT_COST_GROUP = "Transport cost"
 SFS_TRANSPORT_COST_GROUP = "Transport cost (SFS)"
@@ -78,7 +83,7 @@ RA_ORIGIN_HEADER_ALIASES = frozenset({"origin country", "origin"})
 RA_DESTINATION_HEADER_ALIASES = frozenset(
     {"destination country", "destination", "destination iso"}
 )
-RA_FILL_FIELDS = frozenset({"Category", "Shipping Condition"})
+RA_FILL_FIELDS = frozenset()
 RA_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "Tab": ("tab", "tab name", "tab-name"),
     "Origin country": ("origin country", "origin"),
@@ -1141,6 +1146,9 @@ def matrix_row_ra_base_key(row: pd.Series) -> tuple[str, ...]:
 def load_ra_lookup(
     file_path: Path,
 ) -> tuple[dict[tuple[str, ...], list[RaLaneEntry]] | None, frozenset[str] | str]:
+    if not RA_FILL_FIELDS:
+        return None, "Category/Shipping Condition are filled from billing-bs / NSR rules"
+
     ra_df, read_error = read_ra_rate_card_dataframe(file_path)
     if ra_df is None:
         return None, read_error
@@ -1264,11 +1272,20 @@ def business_segment_abbreviation(segment_name: object) -> str:
 
 
 def load_billing_bs_lookup(file_path: Path | None = None) -> dict[str, str]:
+    segment_lookup, _ = load_billing_bs_lookups(file_path)
+    return segment_lookup
+
+
+def load_billing_bs_lookups(
+    file_path: Path | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (account -> business segment, account -> direction/category)."""
     path = file_path or billing_bs_file_path()
     if path is None or not path.exists():
-        return {}
+        return {}, {}
 
-    lookup: dict[str, str] = {}
+    segment_lookup: dict[str, str] = {}
+    direction_lookup: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -1276,10 +1293,85 @@ def load_billing_bs_lookup(file_path: Path | None = None) -> dict[str, str]:
         if len(parts) < 2:
             continue
         account_number = cell_text(parts[0])
+        if not account_number:
+            continue
         business_segment = cell_text(parts[1])
-        if account_number and business_segment:
-            lookup[account_number] = business_segment
-    return lookup
+        if business_segment:
+            segment_lookup[account_number] = business_segment
+        if len(parts) >= 3:
+            direction = cell_text(parts[2])
+            if direction:
+                direction_lookup[account_number] = direction
+    return segment_lookup, direction_lookup
+
+
+def is_billing_return_direction(direction: object) -> bool:
+    text = cell_text(direction).lower()
+    if not text:
+        return False
+    if text in BILLING_RETURN_DIRECTIONS:
+        return True
+    return "return" in text
+
+
+def is_nsr_service_level(service_level: object) -> bool:
+    return bool(NSR_TOKEN_PATTERN.search(cell_text(service_level)))
+
+
+def resolve_category_from_billing_accounts(
+    carrier_accounts: object,
+    direction_lookup: dict[str, str],
+) -> str:
+    if not direction_lookup:
+        return NOT_RETURN_CATEGORY
+
+    directions = [
+        direction_lookup[account_number]
+        for account_number in parse_carrier_account_numbers(
+            carrier_accounts,
+            direction_lookup,
+        )
+    ]
+    if not directions:
+        return NOT_RETURN_CATEGORY
+    if all(is_billing_return_direction(direction) for direction in directions):
+        return RETURN_CATEGORY
+    return NOT_RETURN_CATEGORY
+
+
+def apply_category_and_shipping_condition(
+    matrix_df: pd.DataFrame,
+    *,
+    direction_lookup: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    if matrix_df.empty:
+        return matrix_df
+
+    if direction_lookup is None:
+        _, direction_lookup = load_billing_bs_lookups()
+
+    result = matrix_df.copy()
+    if "Category" not in result.columns:
+        result["Category"] = ""
+    if "Shipping Condition" not in result.columns:
+        result["Shipping Condition"] = ""
+
+    for index, row in result.iterrows():
+        existing_category = cell_text(row.get("Category"))
+        if existing_category == RETURN_CATEGORY:
+            result.at[index, "Category"] = RETURN_CATEGORY
+        else:
+            result.at[index, "Category"] = resolve_category_from_billing_accounts(
+                row.get("Carrier Account number"),
+                direction_lookup,
+            )
+
+        if is_nsr_service_level(row.get("Service level")):
+            result.at[index, "Shipping Condition"] = PM_SHIPPING_CONDITION
+        else:
+            result.at[index, "Shipping Condition"] = NOT_PM_SHIPPING_CONDITION
+
+    return result
 
 
 def parse_carrier_account_numbers(
@@ -1474,14 +1566,23 @@ def enrich_matrix_with_tab_index(
     tab_index_df: pd.DataFrame | None,
     *,
     billing_bs_lookup: dict[str, str] | None = None,
+    billing_direction_lookup: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     tab_index_lookup = build_tab_index_lookup(tab_index_df)
-    if billing_bs_lookup is None:
-        billing_bs_lookup = load_billing_bs_lookup()
+    if billing_bs_lookup is None or billing_direction_lookup is None:
+        loaded_segment, loaded_direction = load_billing_bs_lookups()
+        if billing_bs_lookup is None:
+            billing_bs_lookup = loaded_segment
+        if billing_direction_lookup is None:
+            billing_direction_lookup = loaded_direction
     result = apply_tab_index_metadata(matrix_df, tab_index_lookup)
     result = apply_business_segment_column(result, billing_bs_lookup)
     result = append_return_lanes(result, tab_index_lookup)
     result = apply_service_column(result, tab_index_lookup)
+    result = apply_category_and_shipping_condition(
+        result,
+        direction_lookup=billing_direction_lookup,
+    )
     return finalize_lane_numbers(result)
 
 
@@ -2052,11 +2153,12 @@ def run_build_matrix(
     _, _, bracket_rate_by, sfs_bracket_rate_by = collect_transport_cost_columns(rate_tabs)
     matrix_df = build_shipment_and_cost_rows(rate_tabs, puk_mode=puk_mode)
     tab_index_df = load_tab_index(file_path)
-    billing_bs_lookup = load_billing_bs_lookup()
+    billing_bs_lookup, billing_direction_lookup = load_billing_bs_lookups()
     matrix_df = enrich_matrix_with_tab_index(
         matrix_df,
         tab_index_df,
         billing_bs_lookup=billing_bs_lookup,
+        billing_direction_lookup=billing_direction_lookup,
     )
     if is_eu_fr_postal_duplicate_file(file_path):
         before_count = len(matrix_df)
@@ -2076,6 +2178,11 @@ def run_build_matrix(
         print(f"  Compatible lanes merged: {merged_away}")
     if conflict_row_indices:
         print(f"  Unmerged sibling lanes highlighted orange: {len(conflict_row_indices)}")
+
+    matrix_df = apply_category_and_shipping_condition(
+        matrix_df,
+        direction_lookup=billing_direction_lookup,
+    )
 
     ra_filled_cells: set[tuple[int, str]] = set()
     ra_file = select_ra_file(list_ra_files(), auto=auto)
